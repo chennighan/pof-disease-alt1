@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PoF Disease Answers</title>
+    <link rel="icon" href="./assets/icon.svg" />
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <img src="./assets/icon.svg" alt="" class="icon" />
+        <div>
+          <h1>PoF Disease Answers</h1>
+          <p>Scan the RS chat/dialog text after checking an animal symptom.</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>Automatic screen scan</h2>
+        <p class="muted">Click <strong>Start watching</strong>, then in RuneScape click options like <strong>Check head</strong>. The app scans the lower-left chat/dialog area and diagnoses the symptom text.</p>
+        <div class="actions">
+          <button id="watchBtn">Start watching</button>
+          <button id="scanBtn" class="secondary">Scan now</button>
+          <button id="stopWatchBtn" class="secondary">Stop</button>
+        </div>
+        <details class="scanDetails">
+          <summary>Scan box tuning</summary>
+          <div class="grid">
+            <label>X <input id="scanX" type="number" inputmode="numeric" /></label>
+            <label>Y <input id="scanY" type="number" inputmode="numeric" /></label>
+            <label>W <input id="scanW" type="number" inputmode="numeric" /></label>
+            <label>H <input id="scanH" type="number" inputmode="numeric" /></label>
+          </div>
+          <p class="tiny">Coordinates are inside the RuneScape client window. If it does not read anything, increase W/H or move Y upward/downward depending on your interface layout.</p>
+        </details>
+        <p id="scanStatus" class="tiny">Not scanning yet.</p>
+      </section>
+
+      <section class="card">
+        <label for="symptoms">Detected / manual symptom text</label>
+        <textarea id="symptoms" rows="7" placeholder="Example: Breath smells oddly like socks&#10;Inflamed gums"></textarea>
+        <div class="actions">
+          <button id="diagnoseBtn">Diagnose</button>
+          <button id="clearBtn" class="secondary">Clear</button>
+          <button id="clipboardBtn" class="secondary">Paste clipboard</button>
+        </div>
+      </section>
+
+      <section class="result card" id="resultCard" aria-live="polite">
+        <div class="muted">No symptoms entered yet.</div>
+      </section>
+
+      <section class="card compact">
+        <h2>Fast manual lookup</h2>
+        <input id="filter" type="search" placeholder="Search symptom or disease..." />
+        <div id="lookup"></div>
+      </section>
+
+      <section class="card compact">
+        <h2>Alt1 status</h2>
+        <p id="alt1Status" class="muted"></p>
+        <p class="tiny">This app does not click, inject input, or automate gameplay. It only reads visible pixels/text and tells you which disease matches.</p>
+      </section>
+    </main>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "appName": "PoF Disease Answers",
+  "description": "Answers Player-Owned Farm disease symptoms by matching the symptom text to the correct disease.",
+  "appUrl": "./index.html",
+  "configUrl": "./appconfig.json",
+  "iconUrl": "./assets/icon.svg",
+  "defaultWidth": 360,
+  "defaultHeight": 520,
+  "minWidth": 320,
+  "minHeight": 420,
+  "maxWidth": 700,
+  "maxHeight": 900,
+  "permissions": "pixel,gamestate,overlay"
+}

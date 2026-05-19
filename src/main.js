@@ -1,3 +1,6 @@
+import * as a1lib from "alt1/base";
+import DialogReader from "alt1/dialog";
+
 const DISEASES = [
   {
     name: "Foot-in-mouth",
@@ -198,6 +201,7 @@ let lastOcrAt = 0;
 let lastScanText = "";
 let lastDialogSignature = "";
 let observedSymptoms = new Map();
+const dialogReader = new DialogReader();
 
 function normalize(value) {
   return String(value || "")
@@ -829,11 +833,105 @@ function dialogueSignature(img, region, box) {
   return samples.join(",");
 }
 
+function imgDataSignature(img) {
+  const samples = [];
+  for (let y = Math.round(img.height * 0.25); y < Math.round(img.height * 0.85); y += 12) {
+    for (let x = Math.round(img.width * 0.08); x < Math.round(img.width * 0.92); x += 24) {
+      const index = (x + y * img.width) * 4;
+      samples.push(
+        img.data[index] >> 4,
+        img.data[index + 1] >> 4,
+        img.data[index + 2] >> 4
+      );
+    }
+  }
+  return samples.join(",");
+}
+
 function shouldReadDialogue(img, region, box) {
   const signature = dialogueSignature(img, region, box);
   if (signature && signature === lastDialogSignature) return false;
   lastDialogSignature = signature;
   return true;
+}
+
+function readOfficialDialog() {
+  let imgref;
+  try {
+    imgref = a1lib.captureHoldFullRs();
+  } catch (error) {
+    return { state: "error", error };
+  }
+
+  if (!imgref) return { state: "none" };
+  const pos = dialogReader.find(imgref);
+  if (!pos || !dialogReader.pos) return { state: "none" };
+
+  const box = {
+    x: dialogReader.pos.x,
+    y: dialogReader.pos.y,
+    w: dialogReader.pos.width,
+    h: dialogReader.pos.height
+  };
+  applyScanBox(box);
+
+  let signature = "";
+  try {
+    signature = imgDataSignature(imgref.toData(box.x, box.y, box.w, box.h));
+  } catch (error) {
+    // If signature capture fails, still try reading once.
+  }
+
+  if (signature && signature === lastDialogSignature) return { state: "unchanged", box };
+  lastDialogSignature = signature;
+
+  const read = dialogReader.read(imgref);
+  if (!read) return { state: "found", box, lines: [], text: "" };
+
+  if (read.opts?.length) {
+    return {
+      state: "options",
+      box,
+      options: read.opts.map(opt => opt.text).filter(Boolean)
+    };
+  }
+
+  const lines = uniqueLines(read.text || []);
+  return {
+    state: "text",
+    box,
+    lines,
+    text: lines.join("\n")
+  };
+}
+
+function handleOfficialDialog(result) {
+  if (!result || result.state === "none") {
+    scanStatus.textContent = `Watching for the animal dialogue. Collected ${observedSymptoms.size}/4 checks.`;
+    return false;
+  }
+
+  if (result.state === "unchanged") return true;
+
+  if (result.state === "options") {
+    scanStatus.innerHTML = `Animal options detected. Click a check. Collected ${observedSymptoms.size}/4 checks.`;
+    return true;
+  }
+
+  if (result.state === "found" && !result.text) {
+    scanStatus.innerHTML = `Dialogue detected, waiting for readable text. Collected ${observedSymptoms.size}/4 checks.`;
+    return true;
+  }
+
+  if (result.state === "text") {
+    return handleCapture({
+      box: result.box,
+      lines: result.lines,
+      text: result.text
+    }, false);
+  }
+
+  return false;
 }
 
 function handleCapture(capture, quiet = true) {
@@ -877,6 +975,12 @@ function handleCapture(capture, quiet = true) {
 
 function scanScreenOnce({ quiet = false } = {}) {
   if (!canScan()) return;
+
+  const officialResult = readOfficialDialog();
+  if (officialResult.state !== "error") {
+    handleOfficialDialog(officialResult);
+    return;
+  }
 
   const visualCapture = captureSearchRegion();
   let capture = null;

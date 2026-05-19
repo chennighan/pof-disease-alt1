@@ -166,6 +166,13 @@ const FUZZY_STOP_WORDS = new Set([
   "nose",
   "stomach"
 ]);
+const OPTION_ANCHORS = [
+  "Check the head",
+  "Check the eyes",
+  "Check the legs and feet",
+  "Check the stomach",
+  "Administer treatment"
+];
 
 const symptomInput = document.getElementById("symptoms");
 const diagnoseBtn = document.getElementById("diagnoseBtn");
@@ -383,12 +390,16 @@ function setDefaultScanBox() {
   const height = Number(window.alt1.rsHeight || 0);
   if (!width || !height) return;
 
-  // Default to the lower-left chat/dialog area. These are intentionally editable
-  // because RS interface scaling/layout varies a lot between players.
-  scanX.value = scanX.value || 10;
-  scanY.value = scanY.value || Math.max(0, height - 260);
-  scanW.value = scanW.value || Math.min(760, width - 20);
-  scanH.value = scanH.value || 240;
+  // Default to the beige animal inspection dialogue near the lower center/right
+  // of the RuneScape client. These stay editable because interface scaling varies.
+  const dialogueW = Math.min(560, Math.max(420, Math.round(width * 0.42)));
+  const dialogueH = Math.min(190, Math.max(130, Math.round(height * 0.22)));
+  const dialogueX = width >= 1600 ? Math.round(width * 0.4) : Math.round(width * 0.56);
+  const dialogueY = height >= 900 ? Math.round(height * 0.56) : Math.round(height * 0.74);
+  scanX.value = scanX.value || Math.max(0, dialogueX);
+  scanY.value = scanY.value || Math.max(0, dialogueY);
+  scanW.value = scanW.value || Math.min(dialogueW, width - Number(scanX.value) - 20);
+  scanH.value = scanH.value || dialogueH;
 }
 
 function getScanBox() {
@@ -472,37 +483,52 @@ function collectTextFragments(node, out = []) {
 }
 
 function readLineFromBoundRegion(boundId, x, y) {
-  const args = JSON.stringify({
-    fontname: "chat",
-    allowgap: true
-  });
+  const fontNames = ["chat", "chatmono"];
 
-  try {
-    const raw = window.alt1.bindReadStringEx(boundId, x, y, args);
-    return flattenAlt1Read(raw);
-  } catch (error) {
-    return "";
+  for (const fontname of fontNames) {
+    const args = JSON.stringify({
+      fontname,
+      allowgap: true
+    });
+
+    try {
+      const raw = window.alt1.bindReadStringEx(boundId, x, y, args);
+      const text = flattenAlt1Read(raw);
+      if (looksReadable(text)) return text;
+    } catch (error) {
+      // Try the next Alt1 font profile.
+    }
   }
+
+  return "";
 }
 
-function scanScreenOnce() {
-  if (!canScan()) return;
+function looksReadable(text) {
+  const normalized = normalize(text);
+  if (normalized.length < 3) return false;
+  const letters = normalized.replace(/[^a-z]/g, "").length;
+  return letters >= 3 && letters / Math.max(normalized.length, 1) >= 0.45;
+}
 
-  const box = getScanBox();
+function readTextFromBox(box) {
   let boundId;
   try {
     boundId = window.alt1.bindRegion(box.x, box.y, box.w, box.h);
   } catch (error) {
-    scanStatus.textContent = `Could not bind the scan region: ${error.message || error}`;
-    return;
+    return {
+      box,
+      error: error.message || String(error),
+      lines: [],
+      text: ""
+    };
   }
 
   const lines = [];
-  const xStarts = [4, 12, 24, 40, 62, 82];
+  const xStarts = [12, 24, 40, 56, 72, 96, 128, 160];
 
-  // Chat lines/dialog lines are usually spaced around 14-18 px depending on scaling.
-  // Scan a grid and dedupe so this works across several interface layouts.
-  for (let y = 6; y < box.h - 8; y += 6) {
+  // Dialogue text is usually centered in the beige box, but the exact baseline
+  // shifts with interface scaling. Scan densely and dedupe the successful reads.
+  for (let y = 18; y < box.h - 12; y += 4) {
     for (const x of xStarts) {
       const line = readLineFromBoundRegion(boundId, x, y);
       if (line && line.length >= 3) lines.push(line);
@@ -510,21 +536,102 @@ function scanScreenOnce() {
   }
 
   const text = uniqueLines(lines).join("\n");
-  lastScanText = text;
+  return {
+    box,
+    lines: uniqueLines(lines),
+    text
+  };
+}
 
-  if (!text) {
-    scanStatus.innerHTML = `No readable text found. Try expanding/moving the scan box. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
+function scoreCapture(capture) {
+  if (!capture.text) return 0;
+  const normalized = normalize(capture.text);
+  const optionScore = OPTION_ANCHORS
+    .filter(anchor => normalized.includes(normalize(anchor)))
+    .length * 3;
+  const bestDiseaseScore = rankDiseases(extractMostRelevantDiseaseText(capture.text))[0]?.score || 0;
+  return optionScore + bestDiseaseScore;
+}
+
+function getDynamicScanBoxes() {
+  const width = Number(window.alt1.rsWidth || 0);
+  const height = Number(window.alt1.rsHeight || 0);
+  if (!width || !height) return [];
+
+  const boxW = Math.min(560, Math.max(420, Math.round(width * 0.42)));
+  const boxH = Math.min(190, Math.max(130, Math.round(height * 0.22)));
+  const xRatios = width >= 1600 ? [0.36, 0.4, 0.44, 0.48] : [0.5, 0.56, 0.62];
+  const yRatios = height >= 900 ? [0.52, 0.56, 0.6, 0.64] : [0.68, 0.72, 0.76, 0.8];
+  const boxes = [];
+  const seen = new Set();
+
+  for (const xRatio of xRatios) {
+    for (const yRatio of yRatios) {
+      const x = clamp(Math.round(width * xRatio), 0, Math.max(0, width - boxW));
+      const y = clamp(Math.round(height * yRatio), 0, Math.max(0, height - boxH));
+      const key = `${x}:${y}:${boxW}:${boxH}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      boxes.push({ x, y, w: boxW, h: boxH });
+    }
+  }
+
+  return boxes;
+}
+
+function findBestCapture(initialBox) {
+  const captures = [readTextFromBox(initialBox)];
+  let best = captures[0];
+  let bestScore = scoreCapture(best);
+
+  if (bestScore >= 4) return best;
+
+  for (const box of getDynamicScanBoxes()) {
+    const capture = readTextFromBox(box);
+    const score = scoreCapture(capture);
+    if (score > bestScore) {
+      best = capture;
+      bestScore = score;
+    }
+    if (score >= 4) break;
+  }
+
+  return best;
+}
+
+function applyScanBox(box) {
+  scanX.value = box.x;
+  scanY.value = box.y;
+  scanW.value = box.w;
+  scanH.value = box.h;
+}
+
+function scanScreenOnce() {
+  if (!canScan()) return;
+
+  const capture = findBestCapture(getScanBox());
+  if (capture.error) {
+    scanStatus.textContent = `Could not bind the scan region: ${capture.error}`;
     return;
   }
 
-  const bestText = extractMostRelevantDiseaseText(text);
-  symptomInput.value = bestText || text;
+  applyScanBox(capture.box);
+  lastScanText = capture.text;
+
+  if (!capture.text) {
+    const box = capture.box;
+    scanStatus.innerHTML = `No readable text found. Try opening the animal dialogue or expanding/moving the scan box. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
+    return;
+  }
+
+  const bestText = extractMostRelevantDiseaseText(capture.text);
+  symptomInput.value = bestText || capture.text;
   const best = diagnose("screen scan");
-  scanStatus.innerHTML = `Read ${uniqueLines(lines).length} text line(s).${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
+  scanStatus.innerHTML = `Read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
 
   if (window.alt1.permissionOverlay && best) {
-    const overlayX = (window.alt1.rsX || 0) + box.x;
-    const overlayY = (window.alt1.rsY || 0) + Math.max(0, box.y - 34);
+    const overlayX = (window.alt1.rsX || 0) + capture.box.x;
+    const overlayY = (window.alt1.rsY || 0) + Math.max(0, capture.box.y - 34);
     window.alt1.overLayText(`PoF: ${best.disease}`, 0xFFFFFFFF, 18, overlayX, overlayY, 2500);
   }
 }
@@ -558,7 +665,7 @@ function startWatching() {
   scanScreenOnce();
   const interval = Math.max(Number(window.alt1.captureInterval || 600), 600);
   watchTimer = window.setInterval(scanScreenOnce, interval);
-  scanStatus.textContent = "Watching the lower-left chat/dialog area. Click Check head/body/feet/etc. in game.";
+  scanStatus.textContent = "Watching the animal inspection dialogue. Click Check head/body/feet/etc. in game.";
 }
 
 function stopWatching() {

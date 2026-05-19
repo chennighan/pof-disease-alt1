@@ -180,29 +180,23 @@ const BODY_PART_LABELS = {
   stomach: "Stomach"
 };
 
-const symptomInput = document.getElementById("symptoms");
-const diagnoseBtn = document.getElementById("diagnoseBtn");
-const clearBtn = document.getElementById("clearBtn");
-const clipboardBtn = document.getElementById("clipboardBtn");
 const resultCard = document.getElementById("resultCard");
+const checks = document.getElementById("checks");
 const scanStatus = document.getElementById("scanStatus");
-const lookup = document.getElementById("lookup");
-const filter = document.getElementById("filter");
 const alt1Status = document.getElementById("alt1Status");
 const scanX = document.getElementById("scanX");
 const scanY = document.getElementById("scanY");
 const scanW = document.getElementById("scanW");
 const scanH = document.getElementById("scanH");
 
-const STREAM_FPS = 2;
-const FALLBACK_SCAN_INTERVAL_MS = 1000;
-const DIALOG_OCR_COOLDOWN_MS = 1200;
+const FAST_SCAN_INTERVAL_MS = 250;
+const DIALOG_OCR_COOLDOWN_MS = 250;
 let scanTimer = null;
-let streamState = null;
 let frameScanBusy = false;
 let lastFrameStatus = 0;
 let lastOcrAt = 0;
 let lastScanText = "";
+let lastDialogSignature = "";
 let observedSymptoms = new Map();
 
 function normalize(value) {
@@ -280,10 +274,10 @@ function rankDiseases(text) {
     .sort((a, b) => b.score - a.score);
 }
 
-function diagnose(source = "manual") {
-  const text = symptomInput.value.trim();
+function diagnose(source = "screen scan") {
+  const text = collectedSymptomText();
   if (!text) {
-    resultCard.innerHTML = '<div class="muted">No symptoms entered yet.</div>';
+    renderResult();
     return null;
   }
 
@@ -294,6 +288,7 @@ function diagnose(source = "manual") {
     resultCard.innerHTML = `
       <div class="resultDisease">No confident match</div>
       <div class="muted">Try entering a more specific symptom line from the animal inspection text.</div>
+      ${renderChecksMarkup()}
     `;
     return null;
   }
@@ -307,6 +302,7 @@ function diagnose(source = "manual") {
       <div class="resultDisease">Ambiguous symptoms</div>
       <div class="muted">These symptoms are shared. Check another body part or re-check the animal for a clearer line.</div>
       <ul class="matchList">${alternatives}</ul>
+      ${renderChecksMarkup()}
     `;
     return null;
   }
@@ -333,27 +329,38 @@ function diagnose(source = "manual") {
     <div class="confidence">${confidence} - score ${best.score.toFixed(1)} - ${escapeHtml(source)}</div>
     <ul class="matchList">${topMatches}</ul>
     ${alternatives ? `<p class="muted">Other possible matches:</p><ul class="matchList">${alternatives}</ul>` : ""}
+    ${renderChecksMarkup()}
   `;
   return best;
 }
 
-function renderLookup() {
-  const q = normalize(filter.value);
-  const rows = [];
-  for (const disease of DISEASES) {
-    for (const symptom of disease.symptoms) {
-      const haystack = normalize(`${disease.name} ${symptom}`);
-      if (!q || haystack.includes(q)) {
-        rows.push({ disease: disease.name, symptom });
-      }
-    }
-  }
-  lookup.innerHTML = rows.slice(0, 80).map(row => `
-    <div class="lookupItem">
-      <div class="lookupDisease">${escapeHtml(row.disease)}</div>
-      <div class="symptom">${escapeHtml(row.symptom)}</div>
-    </div>
-  `).join("") || '<p class="muted">No lookup matches.</p>';
+function collectedSymptomText() {
+  return Array.from(observedSymptoms.values()).join("\n");
+}
+
+function renderChecksMarkup() {
+  const rows = ["head", "eyes", "legs", "stomach"].map(part => {
+    const text = observedSymptoms.get(part);
+    return `
+      <div class="checkItem ${text ? "seen" : ""}">
+        <span>${escapeHtml(BODY_PART_LABELS[part])}</span>
+        <small>${text ? escapeHtml(stripExaminePrefix(text)) : "Waiting"}</small>
+      </div>
+    `;
+  }).join("");
+  return `<div class="checks">${rows}</div>`;
+}
+
+function renderResult() {
+  resultCard.innerHTML = `
+    <div class="resultDisease">Waiting</div>
+    <div class="muted">Open the animal options and click checks.</div>
+    ${renderChecksMarkup()}
+  `;
+}
+
+function stripExaminePrefix(text) {
+  return String(text || "").replace(/^You examine the animal's \w+:\s*/i, "");
 }
 
 function escapeHtml(value) {
@@ -363,16 +370,6 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
-}
-
-async function pasteClipboard() {
-  try {
-    const text = await navigator.clipboard.readText();
-    symptomInput.value = text;
-    diagnose("clipboard");
-  } catch (error) {
-    resultCard.innerHTML = '<div class="muted">Clipboard access was blocked. Paste manually with Ctrl+V.</div>';
-  }
 }
 
 function identifyAlt1App() {
@@ -460,8 +457,7 @@ function flattenAlt1Read(value) {
   if (value == null) return "";
 
   // Alt1 normally returns a plain string, but some builds/configs can return
-  // a JSON-ish fragment payload. If we dump that raw into the textarea, the
-  // disease matcher never sees the real symptom sentence.
+  // a JSON-ish fragment payload. Flatten it so the matcher sees the sentence.
   if (typeof value !== "string") {
     try {
       return collectTextFragments(value).join(" ").trim();
@@ -661,14 +657,19 @@ function readTextFromBox(box) {
   }
 
   const lines = [];
-  const xStarts = [36, 52, 72, 96, 128, 164, 204];
+  const reads = [
+    [Math.round(box.w * 0.08), Math.round(box.h * 0.5)],
+    [Math.round(box.w * 0.14), Math.round(box.h * 0.5)],
+    [Math.round(box.w * 0.08), Math.round(box.h * 0.58)],
+    [Math.round(box.w * 0.14), Math.round(box.h * 0.58)],
+    [Math.round(box.w * 0.08), Math.round(box.h * 0.66)],
+    [Math.round(box.w * 0.14), Math.round(box.h * 0.66)]
+  ];
 
-  // Read only the beige content band, not the dark frame or textured edges.
-  for (let y = 44; y < box.h - 20; y += 6) {
-    for (const x of xStarts) {
-      const line = readLineFromBoundRegion(boundId, x, y);
-      if (isUsefulDialogLine(line)) lines.push(line);
-    }
+  // Read only the middle text band. Broad OCR grids are slow and read texture noise.
+  for (const [x, y] of reads) {
+    const line = readLineFromBoundRegion(boundId, x, y);
+    if (isUsefulDialogLine(line)) lines.push(line);
   }
 
   const usefulLines = uniqueLines(lines);
@@ -728,9 +729,6 @@ function parseDialogText(text) {
 function recordSymptom(dialog) {
   if (dialog.kind !== "symptom" || !dialog.text) return;
   observedSymptoms.set(dialog.bodyPart, dialog.text);
-  symptomInput.value = Array.from(observedSymptoms.entries())
-    .map(([part, text]) => `${BODY_PART_LABELS[part] || "Symptom"}: ${text}`)
-    .join("\n");
 }
 
 function getDynamicScanBoxes() {
@@ -807,6 +805,37 @@ function captureSearchRegion() {
   }
 }
 
+function dialogueSignature(img, region, box) {
+  const localX = box.x - region.x;
+  const localY = box.y - region.y;
+  const samples = [];
+  const yStart = Math.round(localY + box.h * 0.42);
+  const yEnd = Math.round(localY + box.h * 0.78);
+  const xStart = Math.round(localX + box.w * 0.08);
+  const xEnd = Math.round(localX + box.w * 0.92);
+
+  for (let y = yStart; y <= yEnd; y += 14) {
+    for (let x = xStart; x <= xEnd; x += 24) {
+      if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
+      const index = (x + y * img.width) * 4;
+      samples.push(
+        img.data[index] >> 4,
+        img.data[index + 1] >> 4,
+        img.data[index + 2] >> 4
+      );
+    }
+  }
+
+  return samples.join(",");
+}
+
+function shouldReadDialogue(img, region, box) {
+  const signature = dialogueSignature(img, region, box);
+  if (signature && signature === lastDialogSignature) return false;
+  lastDialogSignature = signature;
+  return true;
+}
+
 function handleCapture(capture, quiet = true) {
   if (!capture) return false;
   applyScanBox(capture.box);
@@ -852,11 +881,14 @@ function scanScreenOnce({ quiet = false } = {}) {
   const visualCapture = captureSearchRegion();
   let capture = null;
   if (visualCapture) {
-    capture = findBestCaptureFromImage(visualCapture.image, visualCapture.region);
-    if (!capture) {
+    const box = findDialogueBoxInImage(visualCapture.image, visualCapture.region);
+    if (!box) {
       scanStatus.textContent = `Watching for the animal dialogue. Collected ${observedSymptoms.size}/4 checks.`;
       return;
     }
+    applyScanBox(box);
+    if (!shouldReadDialogue(visualCapture.image, visualCapture.region, box)) return;
+    capture = readTextFromBox(box);
   } else {
     capture = findBestCapture(getScanBox());
   }
@@ -902,95 +934,6 @@ function extractMostRelevantDiseaseText(text) {
   return good.length ? good.slice(0, 4).join("\n") : text;
 }
 
-function supportsCaptureStream() {
-  return Boolean(window.ReadableStream && window.fetch && window.alt1?.versionint >= 1004006);
-}
-
-class RawFrameReader {
-  constructor(reader, image) {
-    this.reader = reader;
-    this.image = image;
-    this.frameOffset = 0;
-    this.chunk = null;
-    this.chunkOffset = 0;
-  }
-
-  async readFrame() {
-    const frame = this.image.data;
-    const frameLength = frame.length;
-
-    while (this.frameOffset < frameLength) {
-      if (!this.chunk || this.chunkOffset >= this.chunk.length) {
-        const result = await this.reader.read();
-        if (result.done) return null;
-        this.chunk = result.value;
-        this.chunkOffset = 0;
-      }
-
-      const available = this.chunk.length - this.chunkOffset;
-      const needed = frameLength - this.frameOffset;
-      const count = Math.min(available, needed);
-
-      for (let i = 0; i < count; i++) {
-        const rawOffset = this.frameOffset + i;
-        const channel = rawOffset % 4;
-        const frameIndex = channel === 0
-          ? rawOffset + 2
-          : channel === 2
-            ? rawOffset - 2
-            : rawOffset;
-        frame[frameIndex] = this.chunk[this.chunkOffset + i];
-      }
-
-      this.frameOffset += count;
-      this.chunkOffset += count;
-    }
-
-    this.frameOffset = 0;
-    return this.image;
-  }
-}
-
-async function startCaptureStream() {
-  const region = getSearchRegion();
-  if (!region.w || !region.h) return false;
-
-  const abort = new AbortController();
-  streamState = { abort };
-
-  try {
-    const payload = encodeURIComponent(JSON.stringify({
-      x: region.x,
-      y: region.y,
-      width: region.w,
-      height: region.h,
-      fps: STREAM_FPS,
-      format: "raw"
-    }));
-    const response = await fetch(`https://alt1api/pixel/streamregion/${payload}`, {
-      signal: abort.signal
-    });
-    if (!response.ok || !response.body) throw new Error(`capture stream failed (${response.status})`);
-
-    scanStatus.textContent = "Watching for the animal dialogue.";
-    const reader = new RawFrameReader(response.body.getReader(), new ImageData(region.w, region.h));
-
-    while (streamState?.abort === abort) {
-      const image = await reader.readFrame();
-      if (!image) break;
-      handleStreamFrame(image, region);
-    }
-  } catch (error) {
-    if (streamState?.abort === abort) {
-      streamState = null;
-      startFallbackAutoScan("Capture stream unavailable; using live fallback scan.");
-    }
-    return false;
-  }
-
-  return true;
-}
-
 function handleStreamFrame(image, region) {
   if (frameScanBusy) return;
 
@@ -1004,6 +947,7 @@ function handleStreamFrame(image, region) {
     return;
   }
 
+  if (!shouldReadDialogue(image, region, box)) return;
   if (now - lastOcrAt < DIALOG_OCR_COOLDOWN_MS) return;
   lastOcrAt = now;
   frameScanBusy = true;
@@ -1015,16 +959,16 @@ function handleStreamFrame(image, region) {
   }
 }
 
-function startFallbackAutoScan(message = "Watching for the animal dialogue.") {
-  stopFallbackAutoScan();
+function startFastAutoScan(message = "Watching for the animal dialogue.") {
+  stopFastAutoScan();
   scanStatus.textContent = message;
   scanScreenOnce({ quiet: true });
   scanTimer = window.setInterval(() => {
     scanScreenOnce({ quiet: true });
-  }, FALLBACK_SCAN_INTERVAL_MS);
+  }, FAST_SCAN_INTERVAL_MS);
 }
 
-function stopFallbackAutoScan() {
+function stopFastAutoScan() {
   if (scanTimer) {
     window.clearInterval(scanTimer);
     scanTimer = null;
@@ -1034,38 +978,20 @@ function stopFallbackAutoScan() {
 function startAutoScan() {
   stopAutoScan();
   if (!canScan()) {
-    startFallbackAutoScan();
+    startFastAutoScan();
     return;
   }
 
-  if (supportsCaptureStream()) {
-    startCaptureStream();
-  } else {
-    startFallbackAutoScan("Watching for the animal dialogue.");
-  }
+  startFastAutoScan("Watching for the animal dialogue.");
 }
 
 function stopAutoScan() {
-  stopFallbackAutoScan();
-  if (streamState?.abort) {
-    streamState.abort.abort();
-    streamState = null;
-  }
+  stopFastAutoScan();
 }
 
 window.addEventListener("beforeunload", stopAutoScan);
-diagnoseBtn.addEventListener("click", () => diagnose("manual"));
-clearBtn.addEventListener("click", () => {
-  observedSymptoms = new Map();
-  symptomInput.value = "";
-  diagnose();
-  scanStatus.textContent = "Cleared collected checks. Watching for the animal dialogue.";
-});
-clipboardBtn.addEventListener("click", pasteClipboard);
-symptomInput.addEventListener("input", () => diagnose("manual"));
-filter.addEventListener("input", renderLookup);
 
 identifyAlt1App();
 detectAlt1();
-renderLookup();
+renderResult();
 startAutoScan();

@@ -18,7 +18,7 @@
       </header>
 
       <section class="card">
-        <h2>Automatic screen scan</h2>
+        <h2>Auto diagnosis</h2>
         <p class="muted">The app watches for the animal inspection dialogue. When the beige dialogue box appears, it reads the text inside and diagnoses matching symptoms automatically.</p>
         <details class="scanDetails">
           <summary>Scan box tuning</summary>
@@ -33,24 +33,10 @@
         <p id="scanStatus" class="tiny">Waiting for Alt1.</p>
       </section>
 
-      <section class="card">
-        <label for="symptoms">Detected / manual symptom text</label>
-        <textarea id="symptoms" rows="7" placeholder="Example: Breath smells oddly like socks&#10;Inflamed gums"></textarea>
-        <div class="actions">
-          <button id="diagnoseBtn">Diagnose</button>
-          <button id="clearBtn" class="secondary">Clear</button>
-          <button id="clipboardBtn" class="secondary">Paste clipboard</button>
-        </div>
-      </section>
-
       <section class="result card" id="resultCard" aria-live="polite">
-        <div class="muted">No symptoms entered yet.</div>
-      </section>
-
-      <section class="card compact">
-        <h2>Fast manual lookup</h2>
-        <input id="filter" type="search" placeholder="Search symptom or disease..." />
-        <div id="lookup"></div>
+        <div class="resultDisease">Waiting</div>
+        <div class="muted">Open the animal options and click checks.</div>
+        <div id="checks" class="checks"></div>
       </section>
 
       <section class="card compact">

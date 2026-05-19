@@ -178,9 +178,6 @@ const symptomInput = document.getElementById("symptoms");
 const diagnoseBtn = document.getElementById("diagnoseBtn");
 const clearBtn = document.getElementById("clearBtn");
 const clipboardBtn = document.getElementById("clipboardBtn");
-const scanBtn = document.getElementById("scanBtn");
-const watchBtn = document.getElementById("watchBtn");
-const stopWatchBtn = document.getElementById("stopWatchBtn");
 const resultCard = document.getElementById("resultCard");
 const scanStatus = document.getElementById("scanStatus");
 const lookup = document.getElementById("lookup");
@@ -191,7 +188,8 @@ const scanY = document.getElementById("scanY");
 const scanW = document.getElementById("scanW");
 const scanH = document.getElementById("scanH");
 
-let watchTimer = null;
+const SCAN_INTERVAL_MS = 5000;
+let scanTimer = null;
 let lastScanText = "";
 
 function normalize(value) {
@@ -419,7 +417,7 @@ function clamp(value, min, max) {
 
 function canScan() {
   if (!window.alt1) {
-    scanStatus.textContent = "Open this in Alt1 first.";
+    scanStatus.textContent = "Waiting for Alt1. Open this page inside Alt1 to enable screen scanning.";
     return false;
   }
   if (!window.alt1.permissionPixel) {
@@ -427,7 +425,7 @@ function canScan() {
     return false;
   }
   if (!window.alt1.rsLinked) {
-    scanStatus.textContent = "Alt1 does not see the RuneScape window yet. Click/focus the game, then scan again.";
+    scanStatus.textContent = "Waiting for RuneScape. Focus the game window so Alt1 can read it.";
     return false;
   }
   return true;
@@ -606,7 +604,7 @@ function applyScanBox(box) {
   scanH.value = box.h;
 }
 
-function scanScreenOnce() {
+function scanScreenOnce({ quiet = false } = {}) {
   if (!canScan()) return;
 
   const capture = findBestCapture(getScanBox());
@@ -620,14 +618,16 @@ function scanScreenOnce() {
 
   if (!capture.text) {
     const box = capture.box;
-    scanStatus.innerHTML = `No readable text found. Try opening the animal dialogue or expanding/moving the scan box. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
+    scanStatus.innerHTML = quiet
+      ? `Waiting for animal dialogue. Last search box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`
+      : `No readable text found. Try opening the animal dialogue or expanding/moving the scan box. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
     return;
   }
 
   const bestText = extractMostRelevantDiseaseText(capture.text);
   symptomInput.value = bestText || capture.text;
   const best = diagnose("screen scan");
-  scanStatus.innerHTML = `Read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
+  scanStatus.innerHTML = `Auto-read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
 
   if (window.alt1.permissionOverlay && best) {
     const overlayX = (window.alt1.rsX || 0) + capture.box.x;
@@ -659,38 +659,32 @@ function extractMostRelevantDiseaseText(text) {
   return good.length ? good.slice(0, 4).join("\n") : text;
 }
 
-function startWatching() {
-  if (!canScan()) return;
-  stopWatching();
-  scanScreenOnce();
-  const interval = Math.max(Number(window.alt1.captureInterval || 600), 600);
-  watchTimer = window.setInterval(scanScreenOnce, interval);
-  scanStatus.textContent = "Watching the animal inspection dialogue. Click Check head/body/feet/etc. in game.";
+function startAutoScan() {
+  stopAutoScan();
+  scanScreenOnce({ quiet: true });
+  scanTimer = window.setInterval(() => {
+    scanScreenOnce({ quiet: true });
+  }, SCAN_INTERVAL_MS);
 }
 
-function stopWatching() {
-  if (watchTimer) {
-    window.clearInterval(watchTimer);
-    watchTimer = null;
+function stopAutoScan() {
+  if (scanTimer) {
+    window.clearInterval(scanTimer);
+    scanTimer = null;
   }
 }
 
-window.addEventListener("beforeunload", stopWatching);
+window.addEventListener("beforeunload", stopAutoScan);
 diagnoseBtn.addEventListener("click", () => diagnose("manual"));
 clearBtn.addEventListener("click", () => {
   symptomInput.value = "";
   diagnose();
 });
 clipboardBtn.addEventListener("click", pasteClipboard);
-scanBtn.addEventListener("click", scanScreenOnce);
-watchBtn.addEventListener("click", startWatching);
-stopWatchBtn.addEventListener("click", () => {
-  stopWatching();
-  scanStatus.textContent = "Stopped watching.";
-});
 symptomInput.addEventListener("input", () => diagnose("manual"));
 filter.addEventListener("input", renderLookup);
 
 identifyAlt1App();
 detectAlt1();
 renderLookup();
+startAutoScan();

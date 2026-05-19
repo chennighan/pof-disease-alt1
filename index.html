@@ -19,12 +19,7 @@
 
       <section class="card">
         <h2>Automatic screen scan</h2>
-        <p class="muted">Click <strong>Start watching</strong>, then in RuneScape click options like <strong>Check head</strong>. The app scans the animal inspection dialogue and diagnoses the symptom text.</p>
-        <div class="actions">
-          <button id="watchBtn">Start watching</button>
-          <button id="scanBtn" class="secondary">Scan now</button>
-          <button id="stopWatchBtn" class="secondary">Stop</button>
-        </div>
+        <p class="muted">The app checks the RuneScape screen every 5 seconds. Open the animal inspection dialogue and it will diagnose matching symptom text automatically.</p>
         <details class="scanDetails">
           <summary>Scan box tuning</summary>
           <div class="grid">
@@ -35,7 +30,7 @@
           </div>
           <p class="tiny">Coordinates are inside the RuneScape client window. Aim this at the beige animal dialogue box. If it does not read anything, increase W/H or move Y upward/downward depending on your interface layout.</p>
         </details>
-        <p id="scanStatus" class="tiny">Not scanning yet.</p>
+        <p id="scanStatus" class="tiny">Waiting for Alt1.</p>
       </section>
 
       <section class="card">

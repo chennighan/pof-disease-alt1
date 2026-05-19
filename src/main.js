@@ -188,8 +188,13 @@ const scanY = document.getElementById("scanY");
 const scanW = document.getElementById("scanW");
 const scanH = document.getElementById("scanH");
 
-const SCAN_INTERVAL_MS = 5000;
+const STREAM_FPS = 2;
+const FALLBACK_SCAN_INTERVAL_MS = 1000;
 let scanTimer = null;
+let streamState = null;
+let frameScanBusy = false;
+let lastFrameStatus = 0;
+let lastOcrAt = 0;
 let lastScanText = "";
 
 function normalize(value) {
@@ -410,6 +415,18 @@ function getScanBox() {
   };
 }
 
+function getSearchRegion() {
+  const width = Number(window.alt1?.rsWidth || 0);
+  const height = Number(window.alt1?.rsHeight || 0);
+  const y = Math.max(0, Math.round(height * 0.4));
+  return {
+    x: 0,
+    y,
+    w: width,
+    h: Math.max(1, height - y)
+  };
+}
+
 function clamp(value, min, max) {
   if (Number.isNaN(value)) return min;
   return Math.max(min, Math.min(max, value));
@@ -508,6 +525,113 @@ function looksReadable(text) {
   return letters >= 3 && letters / Math.max(normalized.length, 1) >= 0.45;
 }
 
+function isDialogueBeigePixel(data, index) {
+  const r = data[index];
+  const g = data[index + 1];
+  const b = data[index + 2];
+  return r >= 145 && r <= 245
+    && g >= 125 && g <= 225
+    && b >= 75 && b <= 190
+    && r > g + 4
+    && g > b + 12
+    && r - b > 35;
+}
+
+function isDarkFramePixel(data, index) {
+  const r = data[index];
+  const g = data[index + 1];
+  const b = data[index + 2];
+  return r < 80 && g < 75 && b < 70;
+}
+
+function rowDarkRatio(img, y, x1, x2) {
+  if (y < 0 || y >= img.height) return 0;
+  let dark = 0;
+  let total = 0;
+  const start = clamp(x1, 0, img.width - 1);
+  const end = clamp(x2, 0, img.width - 1);
+  for (let x = start; x <= end; x += 4) {
+    const index = (x + y * img.width) * 4;
+    if (isDarkFramePixel(img.data, index)) dark++;
+    total++;
+  }
+  return total ? dark / total : 0;
+}
+
+function findDialogueBoxInImage(img, region) {
+  const rowHits = [];
+  const step = 4;
+
+  for (let y = 0; y < img.height; y += step) {
+    let currentStart = -1;
+    let bestStart = -1;
+    let bestEnd = -1;
+
+    for (let x = 0; x < img.width; x += step) {
+      const index = (x + y * img.width) * 4;
+      if (isDialogueBeigePixel(img.data, index)) {
+        if (currentStart === -1) currentStart = x;
+      } else if (currentStart !== -1) {
+        if (x - currentStart > bestEnd - bestStart) {
+          bestStart = currentStart;
+          bestEnd = x;
+        }
+        currentStart = -1;
+      }
+    }
+
+    if (currentStart !== -1 && img.width - currentStart > bestEnd - bestStart) {
+      bestStart = currentStart;
+      bestEnd = img.width;
+    }
+
+    if (bestEnd - bestStart >= 320) {
+      rowHits.push({ y, x1: bestStart, x2: bestEnd });
+    }
+  }
+
+  const candidates = [];
+  let current = null;
+  for (const hit of rowHits) {
+    if (!current || hit.y > current.y2 + 40 || hit.x2 < current.x1 || hit.x1 > current.x2) {
+      if (current) candidates.push(current);
+      current = { x1: hit.x1, x2: hit.x2, y1: hit.y, y2: hit.y };
+    } else {
+      current.x1 = Math.min(current.x1, hit.x1);
+      current.x2 = Math.max(current.x2, hit.x2);
+      current.y2 = hit.y;
+    }
+  }
+  if (current) candidates.push(current);
+
+  let best = null;
+  let bestScore = 0;
+  for (const candidate of candidates) {
+    const width = candidate.x2 - candidate.x1;
+    const height = candidate.y2 - candidate.y1;
+    if (width < 320 || height < 35) continue;
+
+    const topFrame = rowDarkRatio(img, candidate.y1 - 28, candidate.x1, candidate.x2);
+    const bottomFrame = rowDarkRatio(img, candidate.y2 + 10, candidate.x1, candidate.x2);
+    const frameScore = Math.max(topFrame, bottomFrame);
+    if (frameScore < 0.12) continue;
+
+    const score = width * height * (1 + frameScore);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+
+  if (!best) return null;
+
+  const x = clamp(region.x + best.x1 - 24, 0, window.alt1.rsWidth - 1);
+  const y = clamp(region.y + best.y1 - 42, 0, window.alt1.rsHeight - 1);
+  const w = clamp((best.x2 - best.x1) + 48, 120, window.alt1.rsWidth - x);
+  const h = clamp((best.y2 - best.y1) + 72, 80, window.alt1.rsHeight - y);
+  return { x, y, w, h };
+}
+
 function readTextFromBox(box) {
   let boundId;
   try {
@@ -597,6 +721,12 @@ function findBestCapture(initialBox) {
   return best;
 }
 
+function findBestCaptureFromImage(img, region) {
+  const box = findDialogueBoxInImage(img, region);
+  if (!box) return null;
+  return readTextFromBox(box);
+}
+
 function applyScanBox(box) {
   scanX.value = box.x;
   scanY.value = box.y;
@@ -604,10 +734,55 @@ function applyScanBox(box) {
   scanH.value = box.h;
 }
 
+function captureSearchRegion() {
+  if (!window.alt1?.capture) return null;
+  const region = getSearchRegion();
+  if (!region.w || !region.h) return null;
+
+  try {
+    return {
+      region,
+      image: new ImageData(window.alt1.capture(region.x, region.y, region.w, region.h), region.w, region.h)
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function handleCapture(capture, quiet = true) {
+  if (!capture) return false;
+  applyScanBox(capture.box);
+  lastScanText = capture.text;
+
+  if (!capture.text) {
+    if (!quiet) {
+      const box = capture.box;
+      scanStatus.innerHTML = `Found the dialogue box, but could not read text yet. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
+    }
+    return false;
+  }
+
+  const bestText = extractMostRelevantDiseaseText(capture.text);
+  symptomInput.value = bestText || capture.text;
+  const best = diagnose("screen scan");
+  scanStatus.innerHTML = `Auto-read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
+
+  if (window.alt1.permissionOverlay && best) {
+    const overlayX = (window.alt1.rsX || 0) + capture.box.x;
+    const overlayY = (window.alt1.rsY || 0) + Math.max(0, capture.box.y - 34);
+    window.alt1.overLayText(`PoF: ${best.disease}`, 0xFFFFFFFF, 18, overlayX, overlayY, 2500);
+  }
+
+  return Boolean(best);
+}
+
 function scanScreenOnce({ quiet = false } = {}) {
   if (!canScan()) return;
 
-  const capture = findBestCapture(getScanBox());
+  const visualCapture = captureSearchRegion();
+  const capture = visualCapture
+    ? findBestCaptureFromImage(visualCapture.image, visualCapture.region) || findBestCapture(getScanBox())
+    : findBestCapture(getScanBox());
   if (capture.error) {
     scanStatus.textContent = `Could not bind the scan region: ${capture.error}`;
     return;
@@ -623,17 +798,7 @@ function scanScreenOnce({ quiet = false } = {}) {
       : `No readable text found. Try opening the animal dialogue or expanding/moving the scan box. Current box: ${box.x}, ${box.y}, ${box.w}, ${box.h}`;
     return;
   }
-
-  const bestText = extractMostRelevantDiseaseText(capture.text);
-  symptomInput.value = bestText || capture.text;
-  const best = diagnose("screen scan");
-  scanStatus.innerHTML = `Auto-read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
-
-  if (window.alt1.permissionOverlay && best) {
-    const overlayX = (window.alt1.rsX || 0) + capture.box.x;
-    const overlayY = (window.alt1.rsY || 0) + Math.max(0, capture.box.y - 34);
-    window.alt1.overLayText(`PoF: ${best.disease}`, 0xFFFFFFFF, 18, overlayX, overlayY, 2500);
-  }
+  handleCapture(capture, quiet);
 }
 
 function uniqueLines(lines) {
@@ -659,18 +824,154 @@ function extractMostRelevantDiseaseText(text) {
   return good.length ? good.slice(0, 4).join("\n") : text;
 }
 
-function startAutoScan() {
-  stopAutoScan();
+function supportsCaptureStream() {
+  return Boolean(window.ReadableStream && window.fetch && window.alt1?.versionint >= 1004006);
+}
+
+class RawFrameReader {
+  constructor(reader, image) {
+    this.reader = reader;
+    this.image = image;
+    this.frameOffset = 0;
+    this.chunk = null;
+    this.chunkOffset = 0;
+  }
+
+  async readFrame() {
+    const frame = this.image.data;
+    const frameLength = frame.length;
+
+    while (this.frameOffset < frameLength) {
+      if (!this.chunk || this.chunkOffset >= this.chunk.length) {
+        const result = await this.reader.read();
+        if (result.done) return null;
+        this.chunk = result.value;
+        this.chunkOffset = 0;
+      }
+
+      const available = this.chunk.length - this.chunkOffset;
+      const needed = frameLength - this.frameOffset;
+      const count = Math.min(available, needed);
+
+      for (let i = 0; i < count; i++) {
+        const rawOffset = this.frameOffset + i;
+        const channel = rawOffset % 4;
+        const frameIndex = channel === 0
+          ? rawOffset + 2
+          : channel === 2
+            ? rawOffset - 2
+            : rawOffset;
+        frame[frameIndex] = this.chunk[this.chunkOffset + i];
+      }
+
+      this.frameOffset += count;
+      this.chunkOffset += count;
+    }
+
+    this.frameOffset = 0;
+    return this.image;
+  }
+}
+
+async function startCaptureStream() {
+  const region = getSearchRegion();
+  if (!region.w || !region.h) return false;
+
+  const abort = new AbortController();
+  streamState = { abort };
+
+  try {
+    const payload = encodeURIComponent(JSON.stringify({
+      x: region.x,
+      y: region.y,
+      width: region.w,
+      height: region.h,
+      fps: STREAM_FPS,
+      format: "raw"
+    }));
+    const response = await fetch(`https://alt1api/pixel/streamregion/${payload}`, {
+      signal: abort.signal
+    });
+    if (!response.ok || !response.body) throw new Error(`capture stream failed (${response.status})`);
+
+    scanStatus.textContent = "Watching for the animal dialogue.";
+    const reader = new RawFrameReader(response.body.getReader(), new ImageData(region.w, region.h));
+
+    while (streamState?.abort === abort) {
+      const image = await reader.readFrame();
+      if (!image) break;
+      handleStreamFrame(image, region);
+    }
+  } catch (error) {
+    if (streamState?.abort === abort) {
+      streamState = null;
+      startFallbackAutoScan("Capture stream unavailable; using live fallback scan.");
+    }
+    return false;
+  }
+
+  return true;
+}
+
+function handleStreamFrame(image, region) {
+  if (frameScanBusy) return;
+
+  const box = findDialogueBoxInImage(image, region);
+  const now = Date.now();
+  if (!box) {
+    if (now - lastFrameStatus > 2000) {
+      scanStatus.textContent = "Watching for the animal dialogue.";
+      lastFrameStatus = now;
+    }
+    return;
+  }
+
+  if (now - lastOcrAt < 700) return;
+  lastOcrAt = now;
+  frameScanBusy = true;
+
+  try {
+    handleCapture(readTextFromBox(box), true);
+  } finally {
+    frameScanBusy = false;
+  }
+}
+
+function startFallbackAutoScan(message = "Watching for the animal dialogue.") {
+  stopFallbackAutoScan();
+  scanStatus.textContent = message;
   scanScreenOnce({ quiet: true });
   scanTimer = window.setInterval(() => {
     scanScreenOnce({ quiet: true });
-  }, SCAN_INTERVAL_MS);
+  }, FALLBACK_SCAN_INTERVAL_MS);
 }
 
-function stopAutoScan() {
+function stopFallbackAutoScan() {
   if (scanTimer) {
     window.clearInterval(scanTimer);
     scanTimer = null;
+  }
+}
+
+function startAutoScan() {
+  stopAutoScan();
+  if (!canScan()) {
+    startFallbackAutoScan();
+    return;
+  }
+
+  if (supportsCaptureStream()) {
+    startCaptureStream();
+  } else {
+    startFallbackAutoScan("Watching for the animal dialogue.");
+  }
+}
+
+function stopAutoScan() {
+  stopFallbackAutoScan();
+  if (streamState?.abort) {
+    streamState.abort.abort();
+    streamState = null;
   }
 }
 

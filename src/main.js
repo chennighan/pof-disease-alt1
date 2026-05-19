@@ -173,6 +173,12 @@ const OPTION_ANCHORS = [
   "Check the stomach",
   "Administer treatment"
 ];
+const BODY_PART_LABELS = {
+  head: "Head",
+  eyes: "Eyes",
+  legs: "Legs/feet",
+  stomach: "Stomach"
+};
 
 const symptomInput = document.getElementById("symptoms");
 const diagnoseBtn = document.getElementById("diagnoseBtn");
@@ -190,12 +196,14 @@ const scanH = document.getElementById("scanH");
 
 const STREAM_FPS = 2;
 const FALLBACK_SCAN_INTERVAL_MS = 1000;
+const DIALOG_OCR_COOLDOWN_MS = 1200;
 let scanTimer = null;
 let streamState = null;
 let frameScanBusy = false;
 let lastFrameStatus = 0;
 let lastOcrAt = 0;
 let lastScanText = "";
+let observedSymptoms = new Map();
 
 function normalize(value) {
   return String(value || "")
@@ -522,7 +530,14 @@ function looksReadable(text) {
   const normalized = normalize(text);
   if (normalized.length < 3) return false;
   const letters = normalized.replace(/[^a-z]/g, "").length;
-  return letters >= 3 && letters / Math.max(normalized.length, 1) >= 0.45;
+  const vowels = normalized.replace(/[^aeiou]/g, "").length;
+  const tokens = normalized.split(" ").filter(Boolean);
+  const longestToken = tokens.reduce((max, token) => Math.max(max, token.length), 0);
+  const repeatedNoise = longestToken >= 12 && tokens.length <= 3;
+  return letters >= 3
+    && vowels >= 2
+    && !repeatedNoise
+    && letters / Math.max(normalized.length, 1) >= 0.45;
 }
 
 function isDialogueBeigePixel(data, index) {
@@ -585,7 +600,7 @@ function findDialogueBoxInImage(img, region) {
       bestEnd = img.width;
     }
 
-    if (bestEnd - bestStart >= 320) {
+    if (bestEnd - bestStart >= 140) {
       rowHits.push({ y, x1: bestStart, x2: bestEnd });
     }
   }
@@ -646,23 +661,31 @@ function readTextFromBox(box) {
   }
 
   const lines = [];
-  const xStarts = [12, 24, 40, 56, 72, 96, 128, 160];
+  const xStarts = [36, 52, 72, 96, 128, 164, 204];
 
-  // Dialogue text is usually centered in the beige box, but the exact baseline
-  // shifts with interface scaling. Scan densely and dedupe the successful reads.
-  for (let y = 18; y < box.h - 12; y += 4) {
+  // Read only the beige content band, not the dark frame or textured edges.
+  for (let y = 44; y < box.h - 20; y += 6) {
     for (const x of xStarts) {
       const line = readLineFromBoundRegion(boundId, x, y);
-      if (line && line.length >= 3) lines.push(line);
+      if (isUsefulDialogLine(line)) lines.push(line);
     }
   }
 
-  const text = uniqueLines(lines).join("\n");
+  const usefulLines = uniqueLines(lines);
+  const text = usefulLines.join("\n");
   return {
     box,
-    lines: uniqueLines(lines),
+    lines: usefulLines,
     text
   };
+}
+
+function isUsefulDialogLine(line) {
+  const normalized = normalize(line);
+  if (!looksReadable(line)) return false;
+  if (normalized.includes("you examine")) return true;
+  if (OPTION_ANCHORS.some(anchor => normalized.includes(normalize(anchor)))) return true;
+  return rankDiseases(line)[0]?.score >= 2;
 }
 
 function scoreCapture(capture) {
@@ -673,6 +696,41 @@ function scoreCapture(capture) {
     .length * 3;
   const bestDiseaseScore = rankDiseases(extractMostRelevantDiseaseText(capture.text))[0]?.score || 0;
   return optionScore + bestDiseaseScore;
+}
+
+function parseDialogText(text) {
+  const lines = uniqueLines(String(text || "").split(/\n+/));
+  const joined = lines.join(" ");
+  const normalized = normalize(joined);
+  const optionHits = OPTION_ANCHORS.filter(anchor => normalized.includes(normalize(anchor))).length;
+  if (optionHits >= 2) {
+    return { kind: "options", lines };
+  }
+
+  const examineText = lines.find(line => normalize(line).includes("you examine")) || joined;
+  const bodyMatch = normalize(examineText).match(/you examine the animal's (head|eyes|legs|stomach)\b/);
+  if (bodyMatch) {
+    return {
+      kind: "symptom",
+      bodyPart: bodyMatch[1],
+      text: examineText
+    };
+  }
+
+  const best = rankDiseases(joined)[0];
+  if (best?.score >= 2) {
+    return { kind: "symptom", bodyPart: "unknown", text: joined };
+  }
+
+  return { kind: "unknown", lines };
+}
+
+function recordSymptom(dialog) {
+  if (dialog.kind !== "symptom" || !dialog.text) return;
+  observedSymptoms.set(dialog.bodyPart, dialog.text);
+  symptomInput.value = Array.from(observedSymptoms.entries())
+    .map(([part, text]) => `${BODY_PART_LABELS[part] || "Symptom"}: ${text}`)
+    .join("\n");
 }
 
 function getDynamicScanBoxes() {
@@ -762,10 +820,22 @@ function handleCapture(capture, quiet = true) {
     return false;
   }
 
-  const bestText = extractMostRelevantDiseaseText(capture.text);
-  symptomInput.value = bestText || capture.text;
+  const dialog = parseDialogText(capture.text);
+  if (dialog.kind === "options") {
+    scanStatus.innerHTML = `Animal options detected. Choose a check; I will read the next symptom dialogue. Collected ${observedSymptoms.size}/4 checks.`;
+    return false;
+  }
+
+  if (dialog.kind !== "symptom") {
+    if (!quiet) {
+      scanStatus.innerHTML = `Dialogue detected, but no symptom text was readable yet. Collected ${observedSymptoms.size}/4 checks.`;
+    }
+    return false;
+  }
+
+  recordSymptom(dialog);
   const best = diagnose("screen scan");
-  scanStatus.innerHTML = `Auto-read ${capture.lines.length} text line(s) from ${capture.box.x}, ${capture.box.y}, ${capture.box.w}, ${capture.box.h}.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " No disease match yet."}`;
+  scanStatus.innerHTML = `Read ${BODY_PART_LABELS[dialog.bodyPart] || "symptom"} symptom. Collected ${observedSymptoms.size}/4 checks.${best ? ` Best match: <strong>${escapeHtml(best.disease)}</strong>.` : " Need another check."}`;
 
   if (window.alt1.permissionOverlay && best) {
     const overlayX = (window.alt1.rsX || 0) + capture.box.x;
@@ -780,9 +850,17 @@ function scanScreenOnce({ quiet = false } = {}) {
   if (!canScan()) return;
 
   const visualCapture = captureSearchRegion();
-  const capture = visualCapture
-    ? findBestCaptureFromImage(visualCapture.image, visualCapture.region) || findBestCapture(getScanBox())
-    : findBestCapture(getScanBox());
+  let capture = null;
+  if (visualCapture) {
+    capture = findBestCaptureFromImage(visualCapture.image, visualCapture.region);
+    if (!capture) {
+      scanStatus.textContent = `Watching for the animal dialogue. Collected ${observedSymptoms.size}/4 checks.`;
+      return;
+    }
+  } else {
+    capture = findBestCapture(getScanBox());
+  }
+
   if (capture.error) {
     scanStatus.textContent = `Could not bind the scan region: ${capture.error}`;
     return;
@@ -926,7 +1004,7 @@ function handleStreamFrame(image, region) {
     return;
   }
 
-  if (now - lastOcrAt < 700) return;
+  if (now - lastOcrAt < DIALOG_OCR_COOLDOWN_MS) return;
   lastOcrAt = now;
   frameScanBusy = true;
 
@@ -978,8 +1056,10 @@ function stopAutoScan() {
 window.addEventListener("beforeunload", stopAutoScan);
 diagnoseBtn.addEventListener("click", () => diagnose("manual"));
 clearBtn.addEventListener("click", () => {
+  observedSymptoms = new Map();
   symptomInput.value = "";
   diagnose();
+  scanStatus.textContent = "Cleared collected checks. Watching for the animal dialogue.";
 });
 clipboardBtn.addEventListener("click", pasteClipboard);
 symptomInput.addEventListener("input", () => diagnose("manual"));

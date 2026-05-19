@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@vitejs/plugin-basic-ssl": "latest",
-    "alt1": "^0.1.3",
     "vite": "latest"
   }
 }
